@@ -47,8 +47,8 @@ build:
 	@echo "${VERSION}" > ${VERSION_FILE}
 	@$(call ised,"s/{{__PMM_WITH_DEBUG__}}/${WITH_DEBUG}/",${TARGET})
 	@$(call ised,"s/{{__PMM_VERSION__}}/$$(cat ${VERSION_FILE})/",${TARGET}) 
-	@$(call ised,"s/{{__PMM_REVISION__}}/$$(git log -n1 --format=%h -- src)/",${TARGET})
-	@$(call ised,"s/{{__PMM_REVISION_DATE__}}/$$(git log -n1 --format='%ai' -- src)/",${TARGET})
+	@$(call ised,"s/{{__PMM_REVISION__}}/$$(git log -n1 --format=%h -- lib)/",${TARGET})
+	@$(call ised,"s/{{__PMM_REVISION_DATE__}}/$$(git log -n1 --format='%ai' -- lib)/",${TARGET})
 	@echo :: Done.
 
 install:

@@ -116,7 +116,7 @@ function log-init() {
     # append debug information.
     if [[ $PMM_WITH_DEBUG == true ]]; then
         cat >> "$PMMLOGF" <<EOF
-# Personal Module Manager - version: dev - revision:  ()
+# Personal Module Manager - version: dev - revision: 48deb24 (2020-10-01 21:05:15 +0200)
 # Session Started: $(strftime "%d/%m/%Y %H:%M:%S" $timestamp)
 # Session Options: $*
 
