@@ -72,3 +72,9 @@ drove me into writing this.
 
 If this project reaches and interests someone, please feel free to tell me your
 thoughts, any feedback is very welcome.
+
+## Disclaimer
+
+PMM is currently heavily unstable as it is still in a very early developement
+stage. Some functionality might not work propertly or at all. Use it with
+caution and at your own risk.
