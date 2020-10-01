@@ -1,0 +1,793 @@
+#!/usr/bin/env zsh
+#                   ____  ____ ___  ____ ___ 
+#                  / __ \/ __ `__ \/ __ `__ \ 
+#                 / /_/ / / / / / / / / / / /
+#                / .___/_/ /_/ /_/_/ /_/ /_/ 
+#               /_/                          
+#
+#                 Personal Module Manager
+#
+# Tool for deploying and managing different environments and tools
+# (as modules) like a package manager.
+#
+# Author: leyeT.
+# License: WTFPL.
+
+# [[[ HELPERS
+
+# pmm-set-env: Sets the requried environment for a proper run.
+function pmm-set-env() {
+    declare -g PMM PMMHOME PMMCONF PMMLOGF PMMDIST PMMREPD
+
+    # comply with the XDG Base Directory Specification
+    export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
+    export XDG_DATA_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}"
+
+    PMM="${${(%):-%x}:A:t}"
+    PMMHOME="${PMMHOME:-${XDG_DATA_HOME}/pmm}"
+    PMMCONF="${PMMCONF:-${XDG_CONFIG_HOME}/pmm}"
+    PMMREPD="${PMMREPD:-${PMMHOME}/repos}"
+    PMMBIND="${PMMBIND:-${PMMHOME}/bin}"
+
+    # make sure the required directories exist.
+    for dir ( ${PMMHOME:A} ${PMMCONF:A} ${PMMREPD:A} ${PMMBIND:A} ); do
+        [[ -d "$dir" ]] || { mkdir -p $dir || { echo "error: unable to create '$dir'"; return 1; } }
+    done
+
+    # set options and load requried modules.
+    setopt EXTENDED_GLOB
+    setopt ERR_RETURN
+    setopt REMATCH_PCRE
+    setopt PIPE_FAIL
+
+    zmodload zsh/datetime  # timestamps
+    zmodload zsh/terminfo  # terminfo capabilities
+    zmodload zsh/pcre      # regular expressions pearl-style
+
+    # set the current distribution.
+    [[ -z "$PMMDIST" ]] && pmm-set-dist
+}
+
+# pmm-set-dist: Sets the current distribution from /etc/os-release.
+#   Distribution is set in the PMMDIST environment variable.
+function pmm-set-dist()
+{
+    declare -g PMMDIST
+    local os_release os_release_id match mbegin mend MATCH MBEGIN MEND
+
+    os_release="$(cat /etc/os-release 2>/dev/null)"
+    [[ ${(f)os_release} =~ 'ID=([A-Za-z]+)' ]] && os_release_id="${match[1]}"
+
+    case "$os_release_id" in
+        *arch*)   PMMDIST="arch" ;;
+        *ubuntu*) PMMDIST="ubuntu" ;;
+        *parrot*) PMMDIST="parrot" ;;
+        *kali*)   PMMDIST="kali" ;;
+        *debian*) PMMDIST="debian" ;;
+        *)        PMMDIST="$os_release_id" ;;
+    esac
+
+    if [[ -z "$PMMDIST" ]]; then
+        echo "error: unable to set current distribution from /etc/os-release," \
+            "you may need to set the PMMDIST variable with the correct value."
+    fi
+}
+
+# pmm-help: Displays the requested help text. This function does not
+#   return.
+function pmm-help() {
+    if [[ -n "$PMM_OP" ]] && (( $+functions[pmm-${PMM_OP}-help] )); then
+        pmm-${PMM_OP}-help
+    else
+        cat <<EOH
+usage: ${PMM:-${${(%):-%x}:A:t}} <operation> [options]
+
+OPERATIONS:
+    -S              Synchronize: Install/upgrade modules.
+    -V              Version: Print current version banner and exit.
+    -h              Help: Show usage message and exit.
+
+OPTIONS:
+    --noconfirm     Avoid user prompts. The script won't ask questions to the user,
+                    this is useful if you want to use ${PMM:-${${(%):-%x}:A:t}} in scripts.
+    --verbose       Show external commands' output.
+
+Use '${PMM:-${${(%):-%x}:A:t}} -h' with an operation for extended help.
+EOH
+    fi
+
+    exit 0
+}
+
+# ]]]
+
+# [[[ LOGGING
+
+PMM_WITH_DEBUG=true
+
+# log-init: Initializes the logging subsystem.
+function log-init() {
+    local timestamp=$EPOCHSECONDS
+
+    # set the value for the log file if missing.
+    PMMLOGF=${PMMLOGF:-"$PMMHOME/log/pmm-$(strftime "%d-%m-%y-%h%m%s").log"}
+    [[ ! -d "${PMMLOGF:A:h}" ]] && mkdir -p "${PMMLOGF:A:h}"
+
+    # append debug information.
+    if [[ $PMM_WITH_DEBUG == true ]]; then
+        cat >> "$PMMLOGF" <<EOF
+# Personal Module Manager - version: dev - revision:  ()
+# Session Started: $(strftime "%d/%m/%Y %H:%M:%S" $timestamp)
+# Session Options: $*
+
+
+EOF
+    fi
+}
+
+function TRACE() {
+    [[ $PMM_WITH_DEBUG == false ]] && return
+
+    local timestamp="$(strftime "%H:%M:%S %d/%m/%Y" $EPOCHSECONDS)"
+    print "$timestamp :: ${functrace[1]} :: $*" >> $PMMLOGF
+}
+
+function INFO() {
+    print -P ":: ${PMM_OP:+"%F{magenta}${PMM_OP}%f :: "}$*"
+}
+
+function WARN() {
+    print -P ":: %B%F{yellow}WARN%f%b :: ${PMM_OP:+"%F{magenta}${PMM_OP}%f :: "}$*"
+}
+
+function ERROR() {
+    local timestamp="$(strftime "%H:%M:%S %d/%m/%Y" $EPOCHSECONDS)"
+    print -P ":: %B%F{red}ERROR%f%b :: ${PMM_OP:+"%F{magenta}$PMM_OP%f :: "}$*" >&2
+    print "$timestamp :: ERROR :: ${functrace[1]} :: $*" >> $PMMLOGF
+    return 1
+}
+
+# ]]]
+
+# [[[ MODULE
+
+# module-export: Exports the module environment to the following
+#   variables:
+#   - MODULE: associative array with module details.
+#   - MODULE_SYM: symlink specifications.
+function module-export() {
+    declare -g -A MODULE
+    declare -g MODULE_SYM
+    local module="$1"
+
+    [[ ! -f "$PMMREPD/$module/module.zsh" ]] && ERROR "missing 'module.zsh' file."
+    [[ ! -r "$PMMREPD/$module/module.zsh" ]] && ERROR "cannot read 'module.zsh' file: permission denied."
+
+    MODULE[name]="${module:t}"
+    MODULE[path]="$PMMREPD/$module"
+    MODULE[repo]="${module:h}"
+    MODULE[uri]="${MODULE[repo]}/${MODULE[name]}"
+
+    source $PMMREPD/$module/module.zsh
+}
+
+# ]]]
+
+# [[[ OPTION PARSING
+
+declare -g PMM_OP           # Operation
+declare -g -A PMM_OPTS      # Command-line options
+declare -g -a PMM_TARGETS   # Supplied targets
+declare -g -a PMM_OPS PMM_SHORTOPTS PMM_LONGOPTS  # available command-line options
+
+# global options.
+PMM_OPS+=( h )
+PMM_SHORTOPTS+=( v )
+PMM_LONGOPTS+=( noconfirm verbose )
+
+# opt-parse: Parses the command-line options.
+function opt-parse() {
+    local TEMP  # used to store the temporary environment.
+
+    # zparseopts won't remove unknown options from the argument list if
+    # they are in the same group as a known option (in the same '-').
+    # for this reason, we will use getopt to expand all known options
+    # so zparseopts will work as expected later.
+    TEMP=$(getopt -o ${(j::)PMM_OPS}${(j::)${(u)PMM_SHORTOPTS}} -l ${(j:,:)${(u)PMM_LONGOPTS}} -n $PMM -- "$@")
+    eval set -- "$TEMP"; unset TEMP
+
+    # (1) parse the operation.
+    opt-parse-op $@
+    eval set -- "$TEMP"; unset TEMP
+
+    [[ -z "$PMM_OP" && ${PMM_OPTS[help]} -eq 0 ]] && ERROR "an operation is required."
+    (( ${PMM_OPTS[help]} )) && pmm-help  # this function does not return.
+
+    # (2) parse operation-specific options.
+    if (( $+functions[pmm-${PMM_OP}-parse-opt] )); then
+        pmm-${PMM_OP}-parse-opt $@
+        eval set -- "$TEMP"; unset TEMP
+    fi
+
+    # (3) parse global options.
+    opt-parse-global $@
+    eval set -- "$TEMP"; unset TEMP
+
+    # (4) parse the supplied target strings.
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --) shift; break ;;  # end of options.
+            *) ERROR "invalid option: $1." ;;
+        esac
+    done
+
+    PMM_TARGETS=( ${(u)@} )
+}
+
+# opt-parse-op: Parses the current operation.
+function opt-parse-op() {
+    local options
+
+    zparseopts -a options -E -D -- $PMM_OPS
+    TEMP="$@"
+
+    for option ( $options ); do
+        case "$option" in
+            -S) opt-set-op "sync" ;;
+            -V) opt-set-op "version" ;;
+            -h) PMM_OPTS[help]=1 ;;
+        esac
+    done
+}
+
+# opt-set-op: Sets the current operation.
+function opt-set-op() {
+    if [[ -n "$PMM_OP" ]]; then
+        unset PMM_OP
+        ERROR "only one operation may be used."
+    fi
+    PMM_OP="$1"
+}
+
+# opt-parse-global: Parses the global command-line options.
+function opt-parse-global() {
+    local options
+
+    zparseopts -A options -D -E -- -noconfirm v -verbose
+    TEMP="$@"
+
+    opt-set-flag "noconfirm" "--noconfirm"
+    opt-set-flag "verbose" "-v|--verbose"
+}
+
+# opt-set-flag: Sets the value of the supplied option based on the
+#   presence of the supplied flags in the 'options' variable.
+function opt-set-flag() {
+    PMM_OPTS[$1]=${${(k)options[(i)$2]:+1}:-0}
+}
+
+# ]]]
+
+# [[[ REPO
+
+# repo-update: Updates the supplied local repository.
+function repo-update() {
+    local repo="$1"
+
+    # make sure this is a git repository.
+    [[ -d "$repo/.git" ]] || ERROR "repository '$repo' is not a git repository (missing .git subdirectory)."
+
+    INFO "updating '$repo' repository..."
+    if (( ${PMM_OPTS[verbose]} )); then
+        git --git-dir="$repo/.git" --work-tree="$repo" --no-pager pull origin | tee -a $PMMLOGF
+    else    
+        git --git-dir="$repo/.git" --work-tree="$repo" --no-pager pull origin &>>! $PMMLOGF \
+            || ERROR "error updating repository (check log file)."
+    fi
+}
+
+# repo-ensure: Ensures there is a local clone of the supplied repo.
+function repo-ensure() {
+    local repo="$1" branch url clone_dir
+
+    url="$(repo-expand-url $repo)"
+    branch="$(repo-parse-branch $repo $url)"
+    clone_dir="$(repo-clone-dir $repo $branch)"
+
+    TRACE "repo-ensure - $repo\n\turl: $url\n\tclone dir: $clone_dir\n\tbranch: ${branch:-master}"
+
+    if [[ -d "$PMMREPD/$clone_dir" || ${PMM_OPTS[noclone]} -eq 1 ]]; then
+        TRACE "repository already available locally."
+        return 0
+    fi
+
+    INFO "cloning '$url' repository..."
+    if (( ${PMM_OPTS[verbose]} )); then
+        git clone --branch "${branch:-master}" -- "$url" "$PMMREPD/$clone_dir" 2>&1 | tee -a $PMMLOGF
+    else
+        git clone --branch "${branch:-master}" -- "$url" "$PMMREPD/$clone_dir" &>>! $PMMLOGF \
+            || ERROR "error cloning repository (check log file)."
+    fi
+}
+
+# repo-expand-url: Expands a repo string to a URL.
+function repo-expand-url() {
+    local match mbegin mend MATCH MBEGIN MEND
+
+    if [[ "$1" =~ '^([A-Za-z\-\d]+)/([A-Za-z\-\d]+)(@(.*))?$' ]]; then
+        echo "https://github.com/${match[1]}/${match[2]}.git"
+    else
+        ERROR "'$1' is not a valid repo string." 
+    fi
+}
+
+# repo-parse-branch: Parses the branch for the supplied repo string.
+function repo-parse-branch() {
+    local repo="$1" url="$2" branch branches
+    local match mbegin mend MATCH MBEGIN MEND
+
+    [[ "$repo" =~ '^([A-Za-z\-\d]+)/([A-Za-z\-\d]+)(@(.*))?$' ]] && branch="${match[4]}"
+
+    if [[ "$branch" =~ '\*' ]]; then
+        branches=$(git ls-remote --tags -q "$url" "$branch"|cut -d'/' -f3|sort -n|tail -1)
+        branch=${${${branches#*/*/}%^*}}  # remove references
+    fi
+
+    echo "$branch"
+}
+
+# repo-clone-dir: Prints the directory path from $PMMREPD where the
+#   target's repository should be cloned.
+function repo-clone-dir() {
+    local repo="$1" branch="$2"
+    echo "${repo%@*}${branch:+"@${${branch//\*/x}//\//-}"}"
+}
+
+# ]]]
+
+# [[[ TARGET
+
+# target-expand: Expands the target string. The result is stored in
+#   the RESULT variable:
+#   - [module] : module uri (<user>/<repo>[@repo]/<module>).
+#   - [targets]: comma-separated list of targets. 
+function target-expand() {
+    local target="${1%:*}" selection=1 match mbegin mend MATCH MBEGIN MEND
+    declare -a matches
+
+    # this regular expression matches all possible target specifications.
+    if [[ "$target" =~ '^(([A-Za-z\-\d]+)/)?(([A-Za-z\-\d]+(@(.*))?)/)?[A-Za-z\-\d]+$' ]]; then
+        if [[ -n "${match[2]}" && -n "${match[4]}" ]]; then
+            RESULT[module]="$target"
+            RESULT[targets]="${1##*:}"
+
+            # full target string specified, no further action required.
+            return 0
+        fi
+
+        # partial target string specified, expand string to match any
+        # installed repositories.
+        # insert a wildcard (*) in any missing element of the string.
+        cd $PMMREPD
+        matches=( ${${match[2]:+${match[4]:+${match[2]}}}:-*}/${match[4]:-${match[2]:-*}}/${target##/*}(N) )
+        cd -
+    else
+        ERROR "invalid target string."
+    fi
+
+    TRACE "partial target string '$target' matches:\n\t${(j/\n\t/)${(s/,/)matches}}"
+
+    case "${#matches}" in
+        0)  ERROR "unable to locate target '$1'." ;;
+        *)  [[ ${#matches} -gt 1 ]] && util-select-from "ambiguous target string, select one from the list:" $matches ;;
+    esac
+
+    RESULT[module]="${matches[$selection]}"
+    RESULT[targets]="${1##*:}"
+}
+
+# target-installed: Checks whether or not the supplied target is
+#   already installed. Ment for tool-install targets.
+function target-installed() {
+    grep -q -E "^$1 | $2 | .*\$" "$PMMHOME/pmm.db" 2>/dev/null
+}
+
+# target-validate: Makes sure the supplied target is valid.
+function target-validate() {
+    local module="$1" target="$2" target_path="$PMMREPD/$1/$2"
+
+    [[ ! -d "$target_path" ]] && ERROR "target '$module:$target' not found."
+
+    if [[ ! -f "$target_path/target.zsh" && ! -f "$target_path/target.link" ]]; then
+        ERROR "target '$module:$target': unspecified target file."
+    fi
+}
+
+# target-install: Installs the supplied target.
+function target-install() {
+    local module="$1" target="$2" t_path="$PMMREPD/$1/$2" installed
+    local match mbegin mend MATCH MBEGIN MEND
+    
+    if [[ -f "$t_path/target.zsh" ]]; then
+        target-installed "$module" "$target" && installed=true || intalled=false
+
+        if [[ "$installed" == true ]]; then
+            (( ${PMM_OPTS[upgrade]} )) && { -target-upgrade; return; }
+            util-ask-boolean "$module:$target is alredy installed, reinstall it?" || return 0
+        fi
+
+        -target-install "$installed"
+    else
+        # this target links files.
+        for line ( ${(f)"$(< $t_path/target.link)"} ); do
+            [[ "$line" =~ "^${PMM_OPTS[host]} \| (.*)+ \| (.*)+\$" ]] || continue
+            -target-link "${match[1]}" "${match[2]}" || continue
+        done
+    fi
+}
+
+# -target-install: Installs the target available on the variable
+#   $target ( from the module $module ). If "true" is supplied to
+#   this function, the module will be reinstalled.
+function -target-install() {
+    local t_path="$PMMREPD/$module/$target" reinstall="$1" install_func
+
+    [[ ! -f "$t_path/target.zsh" ]] && ERROR "missing 'target.zsh' file (target: $module:$target)."
+    [[ ! -r "$t_path/target.zsh" ]] && ERROR "target.zsh: permission denied (target: $module:$target)."
+
+    (  # subshell to avoid environment clashes.
+        declare -A TARGET
+        cd "$t_path"
+        source "./target.zsh"
+
+        install_func="$(target-get-func install $PMMDIST)"
+        [[ -z "$install_func" ]] && { WARN "skipping target $module:$target (no install function)."; return 0; }
+
+        if [[ "$reinstall" == true ]]; then
+            TARGET[version]="$(target-current-version "$module" "$target")"
+            INFO "reinstalling $module:$target..."
+            -target-do-remove
+        else
+            TARGET[version]="${TARGET[version]:-"$( (( $+functions[target-latest-version] )) && target-latest-version )"}"
+            INFO "installing $module:$target (version: ${TARGET[version]})."
+            -target-install-deps
+        fi
+
+        [[ -z "${TARGET[version]}" ]] && ERROR "unable to determine target version."
+        TRACE "${reinstall:+re}installing target $module:$target.\n\tVERSION: ${TARGET[version]}\n\tVERBOSE: ${PMM_OPTS[verbose]}"
+        -target-do-install && INFO "target installed successfully."
+    )
+}
+
+# -target-do-install: Does the actual target installation, target
+#   environment must be already exported and working directory set.
+function -target-do-install() {
+    if (( ${PMM_OPTS[verbose]} )); then
+        $install_func "${TARGET[version]}" 2>&1 | tee -a $PMMLOGF || ERROR "error installing target."
+    else
+        $install_func "${TARGET[version]}" &>>! $PMMLOGF || ERROR "error installing target (check log file)."
+    fi
+
+    # link target binaries.
+    for bin ( bin/*(N) ); do util-link "${bin:A}" "$PMMBIND/${bin:t}" || continue; done
+    echo "$module | $target | ${TARGET[version]}" >>! "$PMMHOME/pmm.db"
+}
+
+# -target-install-deps: Installs the system dependencies.
+function -target-install-deps() {
+    local command
+
+    (( ${PMM_OPTS[nodeps]} )) || [[ -z "${TARGET[dependencies]}" ]] && return 0
+
+    case "$PMMDIST" in
+        arch)
+            command=( pacman -Syu --noconfirm ${(s/ /)TARGET[dependencies]} ) ;;
+        debian | ubuntu | parrot | kali)
+            command=( DEBIAN_FRONTEND=noninteractive apt-get -q -y install ${(s/ /)TARGET[dependencies]} ) ;;
+        *)
+            ERROR "error handling dependencies on this system, install them manually." ;;
+    esac
+
+    if (( ${PMM_OPTS[verbose]} )); then
+        sudo -k $command 2>&1 | tee -a $PMMLOGF || ERROR "error installing dependencies."
+    else
+        sudo -k $command &>>! $PMMLOGF || ERROR "error installing dependencies (check log file)."
+    fi
+}
+
+# target-do-remove: Does the actual target removing, target
+#   environment must be already exported and working directory set.
+function -target-do-remove() {
+    local uninstall_func; uninstall_func="$(target-get-func uninstall $PMMDIST)"
+    
+    # run the uninstall function if present.
+    if [[ -n "$uninstall_func" ]]; then
+        if (( ${PMM_OPTS[verbose]} )); then
+            $uninstall_func 2>&1 | tee -a $PMMLOGF || ERROR "error uninstalling target."
+        else
+            $uninstall_func &>>! $PMMLOGF || ERROR "error uninstalling target (check log file)."
+        fi
+    fi
+
+    # remove binary links.
+    for bin ( bin/*(N) ); do util-unlink "${bin:A}" "$PMMBIND/${bin:t}" || continue; done
+
+    # remove the line in the database file.
+    sed -i "\:^${module} \| $target \| ${TARGET[version]}$:d" "$PMMHOME/pmm.db"
+
+    # clean the directory.
+    target-clean "$module" "$target"
+}
+
+# target-get-func: Prints the name of the requested function, using
+#   the supplied variant as preference if available.
+function target-get-func() {
+    local func_name="$1" variant="$2"
+
+    if [[ -n "$variant" ]] && (( $+functions[target-${func_name}-${variant}] )); then
+        echo "target-${func_name}-${variant}"
+    else
+        (( $+functions[target-$func_name] )) && echo "target-$func_name"
+    fi
+
+    return 0
+}
+
+# target-current-version: Prints the current installed version of the
+#   supplied target.
+function target-current-version() {
+    local module="$1" target="$2"
+    local match mbegin mend MATCH MBEGIN MEND
+
+    for line ( "${(@f)"$(<$PMMHOME/pmm.db)"}" ); do
+        if [[ "$line" =~ "^$module \| $target \| (.*)\$" ]]; then
+            echo "${match[1]}"
+            break
+        fi
+    done
+}
+
+# target-clean: Cleans the target's directory.
+function target-clean() {
+    local module="$1" target="$2"
+    ( cd $PMMREPD/$module/$target && git clean -dffx . 2>&1 >/dev/null )
+}
+
+# ]]]
+
+# [[[ UTILITY
+
+# util-print-list: Prints the supplied list of arguments in a
+#   visually pleasant format.
+function util-print-list() {
+    declare -i index=1 cols=$(echoti cols)
+    declare -i remaining=$cols padding=$(( cols / 4 ))
+
+    printf "\n"
+
+    for word ( $@ ); do
+        if (( ${#word} + 5 > $remaining )); then
+            printf "\n"
+            remaining=$cols
+        fi
+
+        if (( $padding + 5 > $remaining )); then
+            printf "%2d) %s " $index $word
+        else
+            printf "%2d) %-${padding}s " $index $word
+        fi
+
+        (( remaining -= 5 + $(( ${#word} > $padding ? ${#word} : $padding )) ))
+        (( index++ ))
+    done
+
+    printf "\n" 
+}
+
+# util-select-from: Asks the user to choose an item from a
+#   list of supplied options.
+function util-select-from() {
+    local message="$1" user_selection; shift
+    local match mbegin mend MATCH MBEGIN MEND
+
+    # mantain default selection, if none default to 1.
+    selection=${selection:-1}
+
+    # do not prompt if --noconfirm is supplied.
+    (( ${PMM_OPTS[noconfirm]} )) && return
+
+    INFO "$message"
+    util-print-list $@
+    print -n "\n:: Select an option [default=$selection]: " && read -r user_selection
+
+    # check the selection.
+    [[ -z "$user_selection" ]] && return
+    [[ "$user_selection" =~ '^\d+$' ]] && (( $user_selection > 0 && $user_selection < ( ${#@} + 1 ) )) \
+        && selection="$user_selection"
+}
+
+# util-ask-boolean: Asks the user a yes/no question.
+function util-ask-boolean() {
+    local message="$1" answer
+    local match mbegin mend MATCH MBEGIN MEND
+
+    # do not prompt if --noconfirm is supplied.
+    (( ${PMM_OPTS[noconfirm]} )) && return
+
+    while true; do
+        INFO "$message"
+        printf ":: Select an option [Y/n]: " && read -r answer
+        
+        [[ -z "$answer" || "${(L)answer}" =~ "^y(es)?$" ]] && return 0
+        [[ "${(L)answer}" =~ "^n(o)?$" ]] && return 1
+
+        # invalid answer.
+        printf ":: Invalid answer, please type y (yes) or n (no).\n"
+    done
+}
+
+# util-link: Links the supplied file to the specified location.
+function util-link() {
+    local file="$1" dest="$2"
+
+    if [[ -f "$dest" || -d "$dest" || -L "$dest" ]]; then
+        # destination file exists, check if it's a link to $file
+        [[ "${dest:A}" == "$file" ]] && return
+        
+        # if the destination file exists but it isn't a link to $file, back it
+        # up before linking
+        if [[ ! -w "${dest:h}" ]]; then
+            util-ask-boolean "you don't have write permission on the destination, would you like to use sudo?" \
+                && sudo -k mv "$dest" "${dest}.old" 2>&1 >> $PMMLOGF || ERROR "$dest: permission denied."
+        else
+            mv "$dest" "${dest}.old" 2>&1 >> $PMMLOGF
+        fi
+        
+        WARN "$dest already exists, moved to ${dest}.old"
+    fi
+    
+    # link the file to the destination
+    if [[ ! -w "${dest:h}" ]]; then
+        if util-ask-boolean "you don't have write permission on the destination, would you like to use sudo?"; then
+            sudo -k ln -sf "$file" "$dest" 2>&1 >> $PMMLOGF
+        fi
+    else
+        ln -sf "$file" "$dest" 2>&1 >> $PMMLOGF
+    fi
+}
+
+# util-unlink: Unlinks the supplied file only if the symlink ($2)
+#   points to the source ($1).
+function util-unlink() {
+    local src="$1" sym="$2"
+    [[ "${sym:A}" != "$src" ]] && return 0
+
+    if [[ ! -w "${sym:h}" ]]; then
+        if util-ask-boolean "you don't have write permission on the destination, would you like to use sudo?"; then
+            sudo -k unlink $sym 2>&1 >> $PMMLOGF
+        fi
+    else
+        unlink "$sym" 2>&1 >> $PMMLOGF
+    fi
+}
+
+# ]]]
+
+# [[[ SYNCHRONIZE OPERATION
+
+PMM_OPS+=( S )
+PMM_SHORTOPTS+=( S y u )
+PMM_LONGOPTS+=( refresh nodeps upgrade )
+
+# pmm-sync-parse-opt: Parses the operation command-line options.
+function pmm-sync-parse-opt() {
+    local options
+
+    zparseopts -A options -D -E -- y -refresh -nodeps u -upgrade
+    TEMP="$@"
+
+    opt-set-flag "refresh" "-y|--refresh"
+    opt-set-flag "nodeps" "--nodeps"
+    opt-set-flag "upgrade" "-u|--upgrade"
+}
+
+# pmm-sync-help: Shows extended help for the Synchronize operation.
+function pmm-sync-help() {
+    cat <<EOH
+usage: $PMM -S [options] [targets]
+
+OPTIONS:
+    -y | --refresh      Refresh and update the remote repositories.
+    -u | --upgrade      Upgrade the supplied targets. If no target is supplied,
+                        every installed target will be upgraded.
+    --nodeps            Skip target's system dependency installation.
+EOH
+}
+
+# pmm-sync: Synchronize operation.
+function pmm-sync() {
+    declare -A RESULT
+
+    TRACE "starting sync operation..."
+
+    if [[ ${#PMM_TARGETS} -eq 0 ]]; then
+        (( ${PMM_OPTS[refresh]} )) || ERROR "this operation requires, at least, one module."
+    fi
+
+    # check if we need to refresh local repositories.
+    (( ${PMM_OPTS[refresh]} )) && -sync-refresh
+    
+    # evaluate and apply action to all target strings.
+    for target ( $PMM_TARGETS ); do
+        target-expand $target && repo-ensure ${RESULT[module]%/*} || continue
+        [[ -d "$PMMREPD/${RESULT[module]}" ]] || ERROR "module '${RESULT[module]}' not found."
+        (
+            # export the module environment.
+            module-export ${RESULT[module]}
+            # override default targets if the user specified any target manually.
+            [[ -n "${RESULT[targets]}" ]] && MODULE[targets]=${RESULT[targets]}
+
+            # install targets.
+            for target ( ${(us/,/)MODULE[targets]} ); do
+                target-validate "${MODULE[uri]}" "$target" || continue
+                target-install "${MODULE[uri]}" "$target" || target-clean "${MODULE[uri]}" "$target"
+            done
+        )
+    done
+}
+
+# -sync-refresh: Updates the local repositories.
+function -sync-refresh() {
+    declare -a repos; repos=( $PMMREPD/*/.git(N) )
+
+    INFO "updating local repositories..."
+    
+    if [[ ${#repos} -eq 0 ]]; then
+        INFO "no repositories to update."
+        return 0
+    fi
+
+    for repo ( $repos ); do
+        repo-update ${repo:A:h} || true
+    done
+}
+
+# ]]]
+
+# [[[ VERSION OPERATION
+
+PMM_OPS+=( V )
+
+# pmm-version: Version operation, print the version banner and exit.
+function pmm-version() {
+    cat <<EOB
+    ____  ____ ___  ____ ___   Personal Module Manager (dev)
+   / __ \\/ __ \`__ \/ __ \`__ \  Copyright (C) 2020 leyeT
+  / /_/ / / / / / / / / / / /
+ / .___/_/ /_/ /_/_/ /_/ /_/   This program is released under a WTFPL license.
+/_/                            Made with ❤️  by leyeT.
+EOB
+}
+
+# ]]]
+
+# [[[ MAIN
+
+# program flow starts here <---
+
+if [[ "$UID" -eq 0 ]]; then
+    echo ":: Do not run this script as root!"
+    if [[ -n "$SUDO_USER" ]]; then
+        echo ":: Downgrading credentials to '$SUDO_USER'."
+        exec sudo -u "$SUDO_USER" $0 $*
+    fi
+
+    exit 1
+fi
+
+(( $# )) || pmm-help
+pmm-set-env && log-init "$@" && opt-parse "$@" && pmm-${PMM_OP} || exit 1
+
+# ]]]
+
+# vim: ft=zsh foldenable fdm=marker foldmarker=[[[,]]] et fenc=utf-8
