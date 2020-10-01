@@ -463,9 +463,9 @@ function -target-install() {
 #   environment must be already exported and working directory set.
 function -target-do-install() {
     if (( ${PMM_OPTS[verbose]} )); then
-        $install_func "${TARGET[version]}" 2>&1 | tee -a $PMMLOGF || ERROR "error installing target."
+        $install_func 2>&1 | tee -a $PMMLOGF || ERROR "error installing target."
     else
-        $install_func "${TARGET[version]}" &>>! $PMMLOGF || ERROR "error installing target (check log file)."
+        $install_func &>>! $PMMLOGF || ERROR "error installing target (check log file)."
     fi
 
     # link target binaries.
